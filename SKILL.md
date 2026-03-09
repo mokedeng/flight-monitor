@@ -1,6 +1,6 @@
 ---
 name: flight-monitor
-description: 机票价格监控和预测工具。使用 Microsoft Playwright MCP 从智行火车票、飞猪、携程、去哪儿等平台抓取实时价格，每1小时自动检查，提供30天价格预测和目标价提醒。
+description: 机票价格监控和预测工具。使用 Microsoft Playwright MCP 从智行火车票、飞猪、携程、去哪儿等平台抓取实时价格，采用智能阶梯频率策略（深夜3小时/高峰1小时/临行前30分钟），提供30天价格预测和目标价提醒，内置反爬虫保护。
 ---
 
 # Flight Price Monitor (MCP 版本)
@@ -497,7 +497,7 @@ monitor = {
   destination: "TAO",
   date: "2026-03-28",
   targetPrice: 600,
-  checkInterval: 3600000, // 1小时
+  checkInterval: 3600000, // 1小时（基础间隔，会根据阶梯策略调整）
   platforms: ["qunar", "ctrip", "fliggy", "zhixing"],
   status: "active",
   createdAt: timestamp
@@ -506,10 +506,114 @@ monitor = {
 // 2. 保存到本地存储
 saveMonitor(monitor)
 
-// 3. 设置定时检查
-setInterval(() => {
-  checkPrice(monitor)
-}, 3600000)
+// 3. 使用智能调度器（替代固定间隔）
+scheduleNextCheck(monitor)
+```
+
+### 阶梯频率控制策略
+
+为避免触发反爬封禁，同时兼顾价格变动的时效性，采用以下阶梯频率控制：
+
+#### 时间段加权
+
+```javascript
+function getIntervalByTime() {
+  const hour = new Date().getHours();
+
+  // 深夜时段 (01:00 - 06:00)：变动极小，降低频率
+  if (hour >= 1 && hour < 6) {
+    return 3 * 60 * 60 * 1000;  // 3小时
+  }
+
+  // 高峰时段 (09:00 - 18:00)：变动剧烈，保持高频
+  if (hour >= 9 && hour < 18) {
+    return 1 * 60 * 60 * 1000;  // 1小时
+  }
+
+  // 其他时段：标准频率
+  return 2 * 60 * 60 * 1000;  // 2小时
+}
+```
+
+#### 临行前加频
+
+```javascript
+function getIntervalByDaysRemaining(flightDate) {
+  const daysUntilFlight = getDaysUntil(flightDate);
+
+  // 距离出发 < 3 天：库存变动频繁，价格波动剧烈
+  if (daysUntilFlight < 3) {
+    return 30 * 60 * 1000;  // 30分钟
+  }
+
+  // 距离出发 3-7 天：需要密切关注
+  if (daysUntilFlight < 7) {
+    return 1 * 60 * 60 * 1000;  // 1小时
+  }
+
+  // 距离出发 7-15 天：标准监控
+  if (daysUntilFlight < 15) {
+    return 2 * 60 * 60 * 1000;  // 2小时
+  }
+
+  // 距离出发 > 15 天：低频监控即可
+  return 3 * 60 * 60 * 1000;  // 3小时
+}
+```
+
+#### 综合调度器
+
+```javascript
+function scheduleNextCheck(monitor) {
+  // 获取基于时间的间隔
+  const timeBasedInterval = getIntervalByTime();
+
+  // 获取基于临行天数的间隔
+  const daysBasedInterval = getIntervalByDaysRemaining(monitor.date);
+
+  // 取两者中较短的间隔（优先保证临行前的高频）
+  const interval = Math.min(timeBasedInterval, daysBasedInterval);
+
+  // 计算下次检查时间
+  const nextCheck = Date.now() + interval;
+
+  console.log(`📅 下次检查: ${new Date(nextCheck).toLocaleString()} (${formatInterval(interval)})`);
+
+  // 设置动态定时器
+  setTimeout(async () => {
+    await checkPrice(monitor);
+    scheduleNextCheck(monitor);  // 递归调度，每次重新计算间隔
+  }, interval);
+}
+
+function formatInterval(ms) {
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) return `${minutes}分钟`;
+  const hours = Math.round(minutes / 60);
+  return `${hours}小时`;
+}
+```
+
+#### 调度示例
+
+```
+当前时间: 2026-03-10 14:00
+航班日期: 2026-03-28 (距离出发 18 天)
+
+时间段: 14:00 → 高峰时段 → 1小时
+临行天数: 18天 → >15天 → 3小时
+实际间隔: min(1小时, 3小时) = 1小时
+下次检查: 2026-03-10 15:00
+
+---
+
+当前时间: 2026-03-26 03:00
+航班日期: 2026-03-28 (距离出发 2 天)
+
+时间段: 03:00 → 深夜时段 → 3小时
+临行天数: 2天 → <3天 → 30分钟
+实际间隔: min(3小时, 30分钟) = 30分钟
+下次检查: 2026-03-26 03:30
 ```
 
 ### 定时检查流程
@@ -957,11 +1061,84 @@ const prices = await wrapper.evaluate(priceScript);
 
 对于国内平台的反爬虫机制，采用以下策略：
 
+#### 1. 请求频率控制
+
+```javascript
+// 全局请求限流器
+class RequestLimiter {
+  constructor(maxRequestsPerHour = 20) {
+    this.maxRequests = maxRequestsPerHour;
+    this.requests = [];
+  }
+
+  canMakeRequest(platform) {
+    const now = Date.now();
+    const oneHourAgo = now - 60 * 60 * 1000;
+
+    // 清理旧记录
+    this.requests = this.requests.filter(r => r.timestamp > oneHourAgo);
+
+    // 检查每个平台的请求数
+    const platformRequests = this.requests.filter(r => r.platform === platform);
+
+    if (platformRequests.length >= this.maxRequests) {
+      const oldestRequest = platformRequests[0];
+      const waitTime = Math.ceil((oldestRequest.timestamp + 60 * 60 * 1000 - now) / 60000);
+      console.log(`⏳ ${platform} 请求频率限制，需等待 ${waitTime} 分钟`);
+      return false;
+    }
+
+    this.requests.push({ platform, timestamp: now });
+    return true;
+  }
+}
+
+const limiter = new RequestLimiter(15); // 每平台每小时最多15次请求
+```
+
+#### 2. 随机化延迟
+
+```javascript
+function getRandomDelay(baseMs, variance = 0.3) {
+  const varianceMs = baseMs * variance;
+  const randomMs = (Math.random() - 0.5) * 2 * varianceMs;
+  return baseMs + randomMs;
+}
+
+// 使用示例
+const checkInterval = getRandomDelay(
+  2 * 60 * 60 * 1000,  // 基础间隔2小时
+  0.3                   // ±30% 随机波动
+);
+// 实际间隔可能在 1.4-2.6 小时之间
+```
+
+#### 3. 平台轮换策略
+
+```javascript
+// 按优先级排序平台，但每次请求随机选择前3个
+function selectPlatformForRequest(monitors) {
+  const priority = ['zhixing', 'qunar', 'ctrip', 'fliggy'];
+
+  return monitors.map(monitor => {
+    // 随机打乱前3个优先平台
+    const top3 = priority.slice(0, 3).sort(() => Math.random() - 0.5);
+    const rest = priority.slice(3);
+
+    return {
+      ...monitor,
+      platforms: [...top3, ...rest]
+    };
+  });
+}
+```
+
+#### 4. 基础反爬措施
+
 1. **使用移动端 URL**：`m.qunar.com` 而非 `www.qunar.com`
 2. **模拟真实用户行为**：随机延迟，逐个输入而非一次性填写
 3. **截图验证**：每次截图确认页面内容
-4. **多平台轮换**：不频繁访问同一平台
-5. **设置合理的 User-Agent**
+4. **设置合理的 User-Agent**
 
 ```javascript
 // 设置移动端 User-Agent
