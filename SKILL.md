@@ -1061,6 +1061,24 @@ const prices = await wrapper.evaluate(priceScript);
 
 对于国内平台的反爬虫机制，采用以下策略：
 
+#### 0. 时区一致性保障
+
+```javascript
+// 强制使用北京时间（UTC+8），避免服务器时区偏差
+function getBeijingDate() {
+  const now = new Date();
+  const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+  return new Date(utc + (8 * 3600000)); // UTC+8
+}
+
+// 在 parseFuzzyDate 和 getDaysUntil 中使用
+const now = getBeijingDate(); // 替代 new Date()
+```
+
+**重要性**：
+- 如果服务器在 UTC 时区，北京时间晚上 11 点查询 "明天" 可能会解析错误
+- 强制 UTC+8 确保所有用户看到一致的日期解析结果
+
 #### 1. 请求频率控制
 
 ```javascript
@@ -1133,7 +1151,80 @@ function selectPlatformForRequest(monitors) {
 }
 ```
 
-#### 4. 基础反爬措施
+#### 4. 内存泄漏防护
+
+```javascript
+// 全局监控管理器 - 防止重叠计时器
+class MonitorManager {
+  constructor() {
+    this.activeMonitors = new Map();
+  }
+
+  // 注册或更新监控（自动清理旧计时器）
+  register(monitorId, config) {
+    const existing = this.activeMonitors.get(monitorId);
+
+    if (existing && existing.intervalId) {
+      clearInterval(existing.intervalId);
+      clearTimeout(existing.intervalId);
+      console.log(`🔄 清除旧监控: ${monitorId}`);
+    }
+
+    this.activeMonitors.set(monitorId, {
+      ...config,
+      registeredAt: Date.now()
+    });
+
+    return !existing;
+  }
+
+  // 注销监控并清理计时器
+  unregister(monitorId) {
+    const monitor = this.activeMonitors.get(monitorId);
+    if (!monitor) return false;
+
+    if (monitor.intervalId) {
+      clearInterval(monitor.intervalId);
+      clearTimeout(monitor.intervalId);
+    }
+
+    this.activeMonitors.delete(monitorId);
+    return true;
+  }
+
+  // 清理过期监控（超过 24 小时未更新）
+  cleanupStale(maxAge = 24 * 60 * 60 * 1000) {
+    const now = Date.now();
+    let cleaned = 0;
+
+    for (const [monitorId, monitor] of this.activeMonitors) {
+      if (now - monitor.registeredAt > maxAge) {
+        this.unregister(monitorId);
+        cleaned++;
+      }
+    }
+
+    return cleaned;
+  }
+}
+
+const globalMonitorManager = new MonitorManager();
+```
+
+**使用示例**：
+
+```javascript
+// 启动监控（自动处理重复）
+const monitor = await startMonitoring('SZX', 'TAO', '2026-03-28', 600);
+
+// 停止监控
+monitor.stop();
+
+// 或通过管理器直接操作
+globalMonitorManager.unregister('SZX-TAO-2026-03-28');
+```
+
+#### 5. 基础反爬措施
 
 1. **使用移动端 URL**：`m.qunar.com` 而非 `www.qunar.com`
 2. **模拟真实用户行为**：随机延迟，逐个输入而非一次性填写

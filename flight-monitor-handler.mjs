@@ -24,6 +24,161 @@ const require = createRequire(import.meta.url);
 const fs = require('fs');
 
 /**
+ * 时区配置 - 强制使用北京时间 (UTC+8)
+ *
+ * 解决服务器/容器时区为 UTC 时的日期解析偏差问题
+ */
+const TIMEZONE_OFFSET = 8; // 北京时间 UTC+8 (小时)
+
+/**
+ * 获取当前北京时间
+ * @returns {Date} 北京时间的 Date 对象
+ */
+function getBeijingDate() {
+  const now = new Date();
+  // 转换为北京时间（UTC+8）
+  const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+  return new Date(utc + (TIMEZONE_OFFSET * 3600000));
+}
+
+/**
+ * 获取当前北京时间的时间戳
+ * @returns {number} 毫秒时间戳
+ */
+function getBeijingTimestamp() {
+  return getBeijingDate().getTime();
+}
+
+/**
+ * 监控管理器 - 防止内存泄漏
+ *
+ * 跟踪所有活跃的监控计时器，支持清理和去重
+ */
+class MonitorManager {
+  constructor() {
+    // 存储所有活跃的监控: { monitorId: { intervalId, createdAt, ... } }
+    this.activeMonitors = new Map();
+  }
+
+  /**
+   * 注册或更新监控
+   * @param {string} monitorId - 监控 ID
+   * @param {Object} config - 监控配置
+   * @returns {boolean} 如果是新建监控返回 true，更新返回 false
+   */
+  register(monitorId, config) {
+    const existing = this.activeMonitors.get(monitorId);
+
+    // 如果已存在，先清除旧计时器
+    if (existing && existing.intervalId) {
+      clearInterval(existing.intervalId);
+      clearTimeout(existing.intervalId); // 兼容 setTimeout
+      console.log(`  🔄 清除旧监控: ${monitorId}`);
+    }
+
+    // 存储新监控
+    this.activeMonitors.set(monitorId, {
+      ...config,
+      registeredAt: Date.now()
+    });
+
+    return !existing; // 返回是否为新监控
+  }
+
+  /**
+   * 注销监控并清理计时器
+   * @param {string} monitorId - 监控 ID
+   * @returns {boolean} 是否成功清理
+   */
+  unregister(monitorId) {
+    const monitor = this.activeMonitors.get(monitorId);
+    if (!monitor) return false;
+
+    // 清除计时器
+    if (monitor.intervalId) {
+      clearInterval(monitor.intervalId);
+      clearTimeout(monitor.intervalId);
+    }
+
+    this.activeMonitors.delete(monitorId);
+    return true;
+  }
+
+  /**
+   * 更新监控的计时器 ID
+   * @param {string} monitorId - 监控 ID
+   * @param {number} intervalId - 计时器 ID
+   */
+  setIntervalId(monitorId, intervalId) {
+    const monitor = this.activeMonitors.get(monitorId);
+    if (monitor) {
+      monitor.intervalId = intervalId;
+    }
+  }
+
+  /**
+   * 检查监控是否存在
+   * @param {string} monitorId - 监控 ID
+   * @returns {boolean}
+   */
+  has(monitorId) {
+    return this.activeMonitors.has(monitorId);
+  }
+
+  /**
+   * 获取监控信息
+   * @param {string} monitorId - 监控 ID
+   * @returns {Object|null}
+   */
+  get(monitorId) {
+    return this.activeMonitors.get(monitorId) || null;
+  }
+
+  /**
+   * 获取所有活跃监控
+   * @returns {Array} 监控 ID 列表
+   */
+  getActiveMonitors() {
+    return Array.from(this.activeMonitors.keys());
+  }
+
+  /**
+   * 清理所有监控（用于测试或重置）
+   */
+  clearAll() {
+    for (const [monitorId, monitor] of this.activeMonitors) {
+      if (monitor.intervalId) {
+        clearInterval(monitor.intervalId);
+        clearTimeout(monitor.intervalId);
+      }
+    }
+    this.activeMonitors.clear();
+  }
+
+  /**
+   * 清理过期的监控（超过指定时间未更新）
+   * @param {number} maxAge - 最大年龄（毫秒），默认 24 小时
+   * @returns {number} 清理的数量
+   */
+  cleanupStale(maxAge = 24 * 60 * 60 * 1000) {
+    const now = Date.now();
+    let cleaned = 0;
+
+    for (const [monitorId, monitor] of this.activeMonitors) {
+      if (now - monitor.registeredAt > maxAge) {
+        this.unregister(monitorId);
+        cleaned++;
+      }
+    }
+
+    return cleaned;
+  }
+}
+
+// 全局监控管理器实例
+const globalMonitorManager = new MonitorManager();
+
+/**
  * 请求频率限制器 - 防止触发反爬虫封禁
  *
  * 跟踪每个平台的请求频率，确保不超过设定的阈值
@@ -420,7 +575,8 @@ async function getHolidayBufferFactor(dateStr) {
  * @returns {Date|null} - 解析后的日期对象
  */
 function parseFuzzyDate(dateStr) {
-  const now = new Date();
+  // 使用北京时间而非系统时间，避免时区偏差
+  const now = getBeijingDate();
   const normalized = dateStr.toLowerCase().replace(/\s+/g, '');
 
   // ===== 相对日期 =====
@@ -1209,13 +1365,13 @@ function getDynamicInterval(flightDate) {
 }
 
 /**
- * 计算距离航班出发的天数
+ * 计算距离航班出发的天数（使用北京时间）
  * @param {string} flightDate - 航班日期 (YYYY-MM-DD)
  * @returns {number} 天数（可为负数表示已过期）
  */
 function getDaysUntil(flightDate) {
   const flight = new Date(flightDate);
-  const today = new Date();
+  const today = getBeijingDate();
   today.setHours(0, 0, 0, 0);
   flight.setHours(0, 0, 0, 0);
   return Math.ceil((flight - today) / (1000 * 60 * 60 * 24));
@@ -1249,17 +1405,31 @@ function getCurrentTimeSlot() {
 }
 
 /**
- * 监控模式处理器 - 增强版（支持动态频率）
+ * 监控模式处理器 - 增强版（支持动态频率和内存泄漏防护）
  *
  * @param {string} from - 出发地机场代码
  * @param {string} to - 目的地机场代码
  * @param {string} date - 航班日期 (YYYY-MM-DD)
  * @param {number} targetPrice - 目标价格
  * @param {number} baseInterval - 基础间隔（毫秒），会被动态策略覆盖
+ * @param {Function} onPriceUpdate - 价格更新回调函数
  * @returns {Object} 监控对象
  */
-export async function startMonitoring(from, to, date, targetPrice, baseInterval = 3600000) {
+export async function startMonitoring(from, to, date, targetPrice, baseInterval = 3600000, onPriceUpdate = null) {
   const monitorId = `${from}-${to}-${date}`;
+
+  // 检查是否已存在监控，如果存在则先清理
+  const isNew = globalMonitorManager.register(monitorId, {
+    from,
+    to,
+    date,
+    targetPrice,
+    onPriceUpdate
+  });
+
+  if (!isNew) {
+    console.log(`  🔄 检测到已存在的监控，已重置计时器`);
+  }
 
   // 获取节假日信息
   const holidayInfo = await getHolidayFactor(date);
@@ -1284,7 +1454,62 @@ export async function startMonitoring(from, to, date, targetPrice, baseInterval 
   console.log(`\n   💡 策略说明:`);
   console.log(`      • 深夜时段降至3小时/次，高峰保持1小时/次`);
   console.log(`      • 临行前<3天自动提升至30分钟/次`);
+  console.log(`      • 重复启动会自动清理旧计时器，防止内存泄漏`);
   console.log();
+
+  /**
+   * 调度下次检查
+   */
+  const scheduleNextCheck = async () => {
+    // 检查监控是否已被注销
+    if (!globalMonitorManager.has(monitorId)) {
+      console.log(`  ⏹️  监控 ${monitorId} 已停止`);
+      return;
+    }
+
+    // 计算动态间隔
+    const interval = getDynamicInterval(date);
+    const nextCheckTime = new Date(Date.now() + interval);
+
+    console.log(`📅 [${monitorId}] 下次检查: ${nextCheckTime.toLocaleString('zh-CN')} (${formatInterval(interval)})`);
+
+    // 设置定时器
+    const intervalId = setTimeout(async () => {
+      try {
+        // 更新动态间隔
+        const newInterval = getDynamicInterval(date);
+
+        console.log(`\n🔍 [${monitorId}] 开始检查价格...`);
+        console.log(`   当前策略: ${formatInterval(newInterval)}/次`);
+
+        // TODO: 实际执行价格检查逻辑
+        // 这里需要调用 handleFlightQuery 或类似函数获取实时价格
+        // const result = await handleFlightQuery(`${from}到${to}${date}的机票`, mcpTools);
+
+        // 如果有回调函数，调用它
+        if (onPriceUpdate) {
+          // await onPriceUpdate({ /* 价格数据 */ });
+        }
+
+        // 递归调度下次检查
+        await scheduleNextCheck();
+
+      } catch (error) {
+        console.error(`❌ [${monitorId}] 检查出错: ${error.message}`);
+
+        // 即使出错也继续调度（除非监控已停止）
+        if (globalMonitorManager.has(monitorId)) {
+          await scheduleNextCheck();
+        }
+      }
+    }, interval);
+
+    // 保存计时器 ID 以便后续清理
+    globalMonitorManager.setIntervalId(monitorId, intervalId);
+  };
+
+  // 启动第一次调度
+  scheduleNextCheck();
 
   // 返回增强的监控对象
   const monitor = {
@@ -1299,6 +1524,18 @@ export async function startMonitoring(from, to, date, targetPrice, baseInterval 
     start: new Date().toISOString(),
     holidayInfo,
     daysUntil,
+
+    /**
+     * 停止监控
+     */
+    stop() {
+      const stopped = globalMonitorManager.unregister(this.id);
+      if (stopped) {
+        this.status = 'stopped';
+        console.log(`⏹️  监控 ${this.id} 已停止`);
+      }
+      return stopped;
+    },
 
     /**
      * 获取下次检查时间
@@ -1341,9 +1578,19 @@ export async function startMonitoring(from, to, date, targetPrice, baseInterval 
 }
 
 /**
- * 导出节假日函数供外部使用
+ * 导出函数和类供外部使用
  */
-export { getHolidayFactor, parseFuzzyDate, formatDate, RequestLimiter, globalLimiter };
+export {
+  getHolidayFactor,
+  parseFuzzyDate,
+  formatDate,
+  RequestLimiter,
+  globalLimiter,
+  MonitorManager,
+  globalMonitorManager,
+  getBeijingDate,
+  getBeijingTimestamp
+};
 
 // 如果直接运行
 if (import.meta.url === `file://${process.argv[1]}`) {
