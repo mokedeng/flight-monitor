@@ -23,6 +23,69 @@ const __dirname = dirname(__filename);
 const require = createRequire(import.meta.url);
 const fs = require('fs');
 
+/**
+ * 请求频率限制器 - 防止触发反爬虫封禁
+ *
+ * 跟踪每个平台的请求频率，确保不超过设定的阈值
+ */
+class RequestLimiter {
+  constructor(maxRequestsPerHour = 15) {
+    this.maxRequests = maxRequestsPerHour;
+    this.requests = []; // { platform, timestamp }
+  }
+
+  /**
+   * 检查是否可以发起请求
+   * @param {string} platform - 平台名称
+   * @returns {Object} { allowed: boolean, waitTime?: number, reason?: string }
+   */
+  canMakeRequest(platform) {
+    const now = Date.now();
+    const oneHourAgo = now - 60 * 60 * 1000;
+
+    // 清理旧记录
+    this.requests = this.requests.filter(r => r.timestamp > oneHourAgo);
+
+    // 检查每个平台的请求数
+    const platformRequests = this.requests.filter(r => r.platform === platform);
+
+    if (platformRequests.length >= this.maxRequests) {
+      const oldestRequest = platformRequests[0];
+      const waitTime = Math.ceil((oldestRequest.timestamp + 60 * 60 * 1000 - now) / 60000);
+      return {
+        allowed: false,
+        waitTime,
+        reason: `${platform} 请求频率限制，需等待 ${waitTime} 分钟`
+      };
+    }
+
+    this.requests.push({ platform, timestamp: now });
+    return { allowed: true };
+  }
+
+  /**
+   * 获取当前平台的请求计数
+   * @param {string} platform - 平台名称
+   * @returns {number} 最近1小时的请求数
+   */
+  getRequestCount(platform) {
+    const now = Date.now();
+    const oneHourAgo = now - 60 * 60 * 1000;
+    return this.requests.filter(r => r.platform === platform && r.timestamp > oneHourAgo).length;
+  }
+
+  /**
+   * 重置指定平台的请求记录
+   * @param {string} platform - 平台名称
+   */
+  reset(platform) {
+    this.requests = this.requests.filter(r => r.platform !== platform);
+  }
+}
+
+// 全局请求限流器实例
+const globalLimiter = new RequestLimiter(15);
+
 // 机场代码快速映射
 /**
  * 机场代码映射（P2 增强：支持具体机场名称）
@@ -1027,31 +1090,50 @@ export async function handleFlightQuery(query, mcpTools = null) {
   if (mcpTools) {
     console.log('\n🌐 使用 Microsoft Playwright MCP 抓取实时价格...\n');
 
+    // 平台轮换策略：每次随机打乱前3个平台
+    const shuffledPlatforms = [...platforms];
+    const top3 = shuffledPlatforms.splice(0, 3);
+    top3.sort(() => Math.random() - 0.5);
+    platforms.unshift(...top3);
+
     try {
-      // 构建 URL 映射
+      // 构建 URL 映射（过滤掉被限流的平台）
       const platformURLs = {};
-      for (const platform of platforms) {
+      for (const platform of [...new Set(platforms)]) { // 去重
+        // 检查请求频率限制
+        const limitCheck = globalLimiter.canMakeRequest(platform);
+        if (!limitCheck.allowed) {
+          console.log(`  ⏳ ${platform} ${limitCheck.reason}`);
+          continue;
+        }
+
+        const requestCount = globalLimiter.getRequestCount(platform);
+        console.log(`  ✅ ${platform} 可以抓取 (最近1小时: ${requestCount}/${globalLimiter.maxRequests}次)`);
         platformURLs[platform] = generateSearchURL(platform, parsed.from, parsed.to, parsed.date);
       }
 
-      // 使用包装器抓取所有平台（快速失败策略）
-      const results = await scrapeMultiplePlatforms(mcpTools, platformURLs);
+      if (Object.keys(platformURLs).length === 0) {
+        console.log('\n⚠️  所有平台都处于频率限制中，请稍后再试\n');
+      } else {
+        // 使用包装器抓取所有平台（快速失败策略）
+        const results = await scrapeMultiplePlatforms(mcpTools, platformURLs);
 
-      // 处理结果
-      for (const result of results) {
-        if (result.success && result.prices && result.prices.length > 0) {
-          const lowestPrice = Math.min(...result.prices);
-          prices.push({
-            platform: result.platform,
-            price: lowestPrice,
-            url: result.url,
-            allPrices: result.prices
-          });
+        // 处理结果
+        for (const result of results) {
+          if (result.success && result.prices && result.prices.length > 0) {
+            const lowestPrice = Math.min(...result.prices);
+            prices.push({
+              platform: result.platform,
+              price: lowestPrice,
+              url: result.url,
+              allPrices: result.prices
+            });
+          }
         }
-      }
 
-      // 按价格排序
-      prices.sort((a, b) => a.price - b.price);
+        // 按价格排序
+        prices.sort((a, b) => a.price - b.price);
+      }
 
     } catch (error) {
       console.log(`\n⚠️  抓取过程出错: ${error.message}`);
@@ -1070,45 +1152,198 @@ export async function handleFlightQuery(query, mcpTools = null) {
 }
 
 /**
- * 监控模式处理器 - 增强版
+ * 动态间隔计算 - 阶梯频率控制策略
+ *
+ * 为避免触发反爬封禁，同时兼顾价格变动的时效性，采用以下策略：
+ *
+ * 时间段加权:
+ * - 深夜 (01:00 - 06:00): 3小时 - 变动极小，降低频率
+ * - 高峰 (09:00 - 18:00): 1小时 - 变动剧烈，保持高频
+ * - 其他时段: 2小时 - 标准频率
+ *
+ * 临行前加频:
+ * - < 3天: 30分钟 - 库存变动频繁，价格波动剧烈
+ * - 3-7天: 1小时 - 需要密切关注
+ * - 7-15天: 2小时 - 标准监控
+ * - > 15天: 3小时 - 低频监控即可
+ *
+ * @param {string} flightDate - 航班日期 (YYYY-MM-DD)
+ * @returns {number} 间隔时间（毫秒）
  */
-export async function startMonitoring(from, to, date, targetPrice, interval = 3600000) {
+function getDynamicInterval(flightDate) {
+  const hour = new Date().getHours();
+
+  // ===== 时间段加权策略 =====
+  let timeBasedInterval;
+  if (hour >= 1 && hour < 6) {
+    // 深夜时段 (01:00 - 06:00)：变动极小，降低频率
+    timeBasedInterval = 3 * 60 * 60 * 1000; // 3小时
+  } else if (hour >= 9 && hour < 18) {
+    // 高峰时段 (09:00 - 18:00)：变动剧烈，保持高频
+    timeBasedInterval = 1 * 60 * 60 * 1000; // 1小时
+  } else {
+    // 其他时段：标准频率
+    timeBasedInterval = 2 * 60 * 60 * 1000; // 2小时
+  }
+
+  // ===== 临行前加频策略 =====
+  const daysUntilFlight = getDaysUntil(flightDate);
+
+  let daysBasedInterval;
+  if (daysUntilFlight < 3) {
+    // 距离出发 < 3 天：库存变动频繁，价格波动剧烈
+    daysBasedInterval = 30 * 60 * 1000; // 30分钟
+  } else if (daysUntilFlight < 7) {
+    // 距离出发 3-7 天：需要密切关注
+    daysBasedInterval = 1 * 60 * 60 * 1000; // 1小时
+  } else if (daysUntilFlight < 15) {
+    // 距离出发 7-15 天：标准监控
+    daysBasedInterval = 2 * 60 * 60 * 1000; // 2小时
+  } else {
+    // 距离出发 > 15 天：低频监控即可
+    daysBasedInterval = 3 * 60 * 60 * 1000; // 3小时
+  }
+
+  // ===== 取两者中较短的间隔（优先保证临行前的高频）=====
+  return Math.min(timeBasedInterval, daysBasedInterval);
+}
+
+/**
+ * 计算距离航班出发的天数
+ * @param {string} flightDate - 航班日期 (YYYY-MM-DD)
+ * @returns {number} 天数（可为负数表示已过期）
+ */
+function getDaysUntil(flightDate) {
+  const flight = new Date(flightDate);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  flight.setHours(0, 0, 0, 0);
+  return Math.ceil((flight - today) / (1000 * 60 * 60 * 24));
+}
+
+/**
+ * 格式化时间间隔为可读字符串
+ * @param {number} ms - 毫秒数
+ * @returns {string} 格式化后的字符串
+ */
+function formatInterval(ms) {
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) return `${minutes}分钟`;
+  const hours = Math.round(minutes / 60);
+  return `${hours}小时`;
+}
+
+/**
+ * 获取当前时段描述
+ * @returns {string} 时段描述
+ */
+function getCurrentTimeSlot() {
+  const hour = new Date().getHours();
+  if (hour >= 1 && hour < 6) return '深夜 (变动极小)';
+  if (hour >= 6 && hour < 9) return '早晨 (标准)';
+  if (hour >= 9 && hour < 12) return '上午高峰';
+  if (hour >= 12 && hour < 14) return '午间 (标准)';
+  if (hour >= 14 && hour < 18) return '下午高峰';
+  if (hour >= 18 && hour < 22) return '晚间 (标准)';
+  return '深夜 (变动极小)';
+}
+
+/**
+ * 监控模式处理器 - 增强版（支持动态频率）
+ *
+ * @param {string} from - 出发地机场代码
+ * @param {string} to - 目的地机场代码
+ * @param {string} date - 航班日期 (YYYY-MM-DD)
+ * @param {number} targetPrice - 目标价格
+ * @param {number} baseInterval - 基础间隔（毫秒），会被动态策略覆盖
+ * @returns {Object} 监控对象
+ */
+export async function startMonitoring(from, to, date, targetPrice, baseInterval = 3600000) {
   const monitorId = `${from}-${to}-${date}`;
 
   // 获取节假日信息
   const holidayInfo = await getHolidayFactor(date);
+
+  // 计算动态间隔
+  const dynamicInterval = getDynamicInterval(date);
+  const daysUntil = getDaysUntil(date);
 
   console.log(`\n✅ 监控已启动！`);
   console.log(`   ID: ${monitorId}`);
   console.log(`   航线: ${from} → ${to}`);
   console.log(`   日期: ${date}${holidayInfo.isHoliday ? ` (${holidayInfo.name})` : ''}`);
   console.log(`   目标价: ¥${targetPrice}`);
-  console.log(`   检查频率: 每 ${interval / 3600000} 小时`);
+  console.log(`   距离出发: ${daysUntil} 天`);
+  console.log(`   当前时段: ${getCurrentTimeSlot()}`);
+  console.log(`   📊 动态频率: ${formatInterval(dynamicInterval)}/次`);
 
   if (holidayInfo.isHoliday && holidayInfo.factor > 1.0) {
     console.log(`   ⚠️  节假日系数: ${holidayInfo.factor}x，价格可能偏高`);
   }
 
+  console.log(`\n   💡 策略说明:`);
+  console.log(`      • 深夜时段降至3小时/次，高峰保持1小时/次`);
+  console.log(`      • 临行前<3天自动提升至30分钟/次`);
   console.log();
 
-  // 返回监控对象
-  return {
+  // 返回增强的监控对象
+  const monitor = {
     id: monitorId,
     from,
     to,
     date,
     targetPrice,
-    interval,
+    baseInterval,
+    currentInterval: dynamicInterval,
     status: 'running',
     start: new Date().toISOString(),
-    holidayInfo
+    holidayInfo,
+    daysUntil,
+
+    /**
+     * 获取下次检查时间
+     * @returns {Date} 下次检查时间
+     */
+    getNextCheckTime() {
+      return new Date(Date.now() + this.currentInterval);
+    },
+
+    /**
+     * 更新动态间隔（每次检查时调用）
+     * @returns {number} 新的间隔时间
+     */
+    updateInterval() {
+      this.currentInterval = getDynamicInterval(this.date);
+      this.daysUntil = getDaysUntil(this.date);
+      return this.currentInterval;
+    },
+
+    /**
+     * 获取当前策略说明
+     * @returns {string} 策略说明
+     */
+    getStrategyInfo() {
+      const interval = formatInterval(this.currentInterval);
+      const timeSlot = getCurrentTimeSlot();
+      const days = this.daysUntil;
+
+      let strategy = `当前: ${interval}/次 (${timeSlot})`;
+      if (days < 3) {
+        strategy += ` | 临行前: 高频监控 (剩余${days}天)`;
+      } else if (days > 15) {
+        strategy += ` | 远期: 低频监控 (剩余${days}天)`;
+      }
+      return strategy;
+    }
   };
+
+  return monitor;
 }
 
 /**
  * 导出节假日函数供外部使用
  */
-export { getHolidayFactor, parseFuzzyDate, formatDate };
+export { getHolidayFactor, parseFuzzyDate, formatDate, RequestLimiter, globalLimiter };
 
 // 如果直接运行
 if (import.meta.url === `file://${process.argv[1]}`) {
