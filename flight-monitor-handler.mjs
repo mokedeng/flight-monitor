@@ -1327,7 +1327,8 @@ export async function handleFlightQuery(query, mcpTools = null) {
  * @returns {number} 间隔时间（毫秒）
  */
 function getDynamicInterval(flightDate) {
-  const hour = new Date().getHours();
+  // 使用北京时间获取当前小时
+  const hour = getBeijingDate().getHours();
 
   // ===== 时间段加权策略 =====
   let timeBasedInterval;
@@ -1390,11 +1391,12 @@ function formatInterval(ms) {
 }
 
 /**
- * 获取当前时段描述
+ * 获取当前时段描述（使用北京时间）
  * @returns {string} 时段描述
  */
 function getCurrentTimeSlot() {
-  const hour = new Date().getHours();
+  // 使用北京时间获取当前小时
+  const hour = getBeijingDate().getHours();
   if (hour >= 1 && hour < 6) return '深夜 (变动极小)';
   if (hour >= 6 && hour < 9) return '早晨 (标准)';
   if (hour >= 9 && hour < 12) return '上午高峰';
