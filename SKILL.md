@@ -23,7 +23,7 @@ description: 机票价格监控和预测工具。使用 Microsoft Playwright MCP
 
 | 平台 | URL | 状态 | 特点 |
 |------|-----|------|------|
-| **智行火车票** | zhixing.com | ✅ 主要 | 价格通常最低，机票+火车combo |
+| **智行火车票** | suanya.com | ✅ 主要 | 价格通常最低，机票+火车combo |
 | **去哪儿** | qunar.com | ✅ 主要 | 国内航班最全，价格准确 |
 | **携程** | ctrip.com | ✅ 主要 | 服务好，有保障 |
 | **飞猪** | fliggy.com | ✅ 备用 | 阿里系，有优惠券 |
@@ -234,11 +234,11 @@ URL: https://www.fliggy.com/flight_
 航空公司: .airline-logo + span
 ```
 
-#### 智行火车票 (zhixing.com)
+#### 智行火车票 (suanya.com)
 
 ```javascript
 // 搜索页面
-URL: https://www.zhixing.com/huochepiao/
+URL: https://m.suanya.com/flight/list
 
 // 需要先切换到机票 tab
 机票 tab: a[href*="flight"]
@@ -1224,12 +1224,82 @@ monitor.stop();
 globalMonitorManager.unregister('SZX-TAO-2026-03-28');
 ```
 
-#### 5. 基础反爬措施
+#### 5. 标签页复用和登录检测
+
+```javascript
+// 标签页管理：为每个平台创建独立的标签页
+class PlaywrightMCPWrapper {
+  constructor(mcpTools) {
+    this.platformTabs = new Map();  // 平台 -> 标签页索引
+    this.loginRequiredPlatforms = new Set();  // 需要登录的平台
+  }
+
+  // 复用已有标签页，或创建新标签页
+  async scrapeFlightPrice(platform, url, options = {}) {
+    if (this.platformTabs.has(platform)) {
+      const tabIndex = this.platformTabs.get(platform);
+      await this.switchTab(tabIndex);
+      // 复用成功，在当前标签页中导航
+    } else {
+      await this.newTab();
+      // 为新平台创建标签页
+    }
+    await this.goto(url);
+
+    // 检测是否需要登录
+    const loginCheck = await this.detectLoginRequired();
+    if (loginCheck.required) {
+      return {
+        loginRequired: true,
+        tabOpen: true  // 保持标签页打开，方便用户登录
+      };
+    }
+
+    // ... 正常抓取流程
+    return {
+      success: true,
+      prices: [...],
+      tabOpen: true  // 标签页保持打开，方便用户下单
+    };
+  }
+}
+```
+
+**优势：**
+
+1. **标签页复用** - 每个平台使用独立的标签页，后续查询可直接切换
+2. **登录状态保持** - 用户在一个标签页登录后，后续查询可以复用
+3. **方便下单** - 抓取完成后标签页保持打开，用户可以直接下单
+4. **智能登录检测** - 自动检测登录弹窗、登录页等提示
+5. **分步处理** - 先抓取不需要登录的平台，最后提示用户登录需要登录的平台
+
+**使用示例：**
+
+```javascript
+// 抓取多个平台（会自动处理登录和标签页）
+const result = await scrapeMultiplePlatforms(mcpTools, {
+  qunar: 'https://m.flight.qunar.com/...',
+  fliggy: 'https://m.fliggy.com/...'
+});
+
+// 返回结果包含：
+// - results: 所有平台的抓取结果
+// - successfulPlatforms: 成功获取价格的平台
+// - loginRequiredPlatforms: 需要登录的平台
+// - wrapper: 包装器实例（可用于后续操作）
+
+// 标签页保持打开，用户可以：
+// 1. 直接在对应标签页中下单
+// 2. 手动登录需要登录的平台后，再次查询
+```
+
+#### 6. 基础反爬措施
 
 1. **使用移动端 URL**：`m.qunar.com` 而非 `www.qunar.com`
 2. **模拟真实用户行为**：随机延迟，逐个输入而非一次性填写
 3. **截图验证**：每次截图确认页面内容
 4. **设置合理的 User-Agent**
+5. **标签页保持打开**：抓取完成后不关闭标签页，方便用户直接下单
 
 ```javascript
 // 设置移动端 User-Agent

@@ -91,12 +91,12 @@ const PLATFORMS = {
   },
   fliggy: {
     name: "飞猪",
-    url: "https://www.fliggy.com/flight",
-    mobile: true
+    url: "https://www.fliggy.com/",
+    mobile: false
   },
   zhixing: {
     name: "智行火车票",
-    url: "https://m.zhixing.com/flight", // 移动端
+    url: "https://m.suanya.com/flight", // 移动端
     mobile: true
   }
 };

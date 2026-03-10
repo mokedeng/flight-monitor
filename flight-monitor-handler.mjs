@@ -309,8 +309,8 @@ const AIRPORT_MAP = {
 const MOBILE_URLS = {
   qunar: 'https://m.flight.qunar.com/otn/roundtrip/flight',
   ctrip: 'https://m.ctrip.com/webapp/flight/index',
-  fliggy: 'https://m.fliggy.com/flight',
-  zhixing: 'https://m.zhixing.com/flight'
+  fliggy: 'https://www.fliggy.com/',
+  zhixing: 'https://m.suanya.com/flight'
 };
 
 // 节假日缓存目录
@@ -1107,16 +1107,26 @@ async function parseQuery(query) {
  */
 function generateSearchURL(platform, from, to, date) {
   const baseUrls = {
+    // OTA平台
     qunar: `https://m.flight.qunar.com/otn/roundtrip/flight?departCode=${from}&arriveCode=${to}&departDate=${date}`,
     ctrip: `https://m.ctrip.com/webapp/flight/flightone?dcity=${from}&acity=${to}&date=${date}`,
-    fliggy: `https://m.fliggy.com/flight/index.htm?departureCity=${from}&arrivalCity=${to}&departDate=${date}`,
-    zhixing: `https://m.zhixing.com/flight/list?departCity=${from}&arriveCity=${to}&departDate=${date}`
+    fliggy: `https://www.fliggy.com/`,
+    zhixing: `https://m.suanya.com/flight/list?departCity=${from}&arriveCity=${to}&departDate=${date}`,
+    // 航空公司官网
+    csair: `https://www.csair.com`,
+    ceair: `https://www.ceair.com`,
+    hnair: `https://www.hainanairlines.com`,
+    xiamenair: `https://www.xiamenair.com`,
+    shandong: `https://www.sda.cn/webuser/orderHomeTicket.html`,
+    shenzhen: `https://www.shenzhenair.com/szair_B2C/toFlightSearch.action`
   };
   return baseUrls[platform] || baseUrls.qunar;
 }
 
 /**
- * 生成比价报告 - 增强版
+ * 生成跨平台航班比价报告 - 新版
+ *
+ * 显示同一航班在不同平台的价格对比，标出最低价
  */
 async function generateReport(from, to, date, platforms, prices, options = {}) {
   const today = new Date().toLocaleDateString('zh-CN');
@@ -1127,84 +1137,146 @@ async function generateReport(from, to, date, platforms, prices, options = {}) {
 
   // 平台名称映射
   const platformNames = {
+    // OTA平台
     'qunar': '去哪儿',
     'ctrip': '携程',
     'fliggy': '飞猪',
-    'zhixing': '智行'
+    'zhixing': '智行',
+    // 航空公司官网
+    'csair': '南方航空',
+    'ceair': '东方航空',
+    'hnair': '海南航空',
+    'xiamenair': '厦门航空',
+    'shandong': '山东航空',
+    'shenzhen': '深圳航空'
   };
 
+  // 检查是否有航班详情数据
+  const hasFlightDetails = prices.length > 0 && prices[0].departureTime;
+
   let report = `
-┌─────────────────────────────────────────────────┐
-│            航班价格查询报告                        │
-├─────────────────────────────────────────────────┤
-│  航线:   ${from} → ${to}                           │
-│  日期:   ${date}${holidayInfo.isHoliday ? ` (${holidayInfo.name})` : ''}            │
-│  查询时间: ${today}                            │
-│  距离出发: ${daysUntil} 天                           │`;
+┌─────────────────────────────────────────────────────────────┐
+│                  航班价格查询报告                             │
+├─────────────────────────────────────────────────────────────┤
+│  航线:   ${from} → ${to}                                          │
+│  日期:   ${date}${holidayInfo.isHoliday ? ` (${holidayInfo.name})` : ''}                            │
+│  查询时间: ${today}                                          │
+│  距离出发: ${daysUntil} 天                                              │`;
 
   // 显示节假日预警
   if (holidayInfo.isHoliday && holidayInfo.factor > 1.0) {
-    report += `│  ⚠️  节假日系数: ${holidayInfo.factor}x (价格可能上涨)         │`;
+    report += `│  ⚠️  节假日系数: ${holidayInfo.factor}x (价格可能上涨)                    │`;
   }
 
-  report += `├─────────────────────────────────────────────────┤`;
+  report += `├─────────────────────────────────────────────────────────────┤`;
 
   // 显示过滤选项
   if (options.directOnly) {
-    report += `│  筛选:   直飞航班                                  │`;
+    report += `│  筛选:   直飞航班                                                    │`;
   }
   if (options.preferredTime) {
     const timeMap = { morning: '上午', afternoon: '下午', evening: '晚上' };
-    report += `│  筛选:   ${timeMap[options.preferredTime]}起飞                │`;
+    report += `│  筛选:   ${timeMap[options.preferredTime]}起飞                                              │`;
   }
 
-  report += `│  📊 全网价格对比:                                 │`;
+  if (hasFlightDetails) {
+    // 跨平台航班对比模式
+    report += `│  📊 同一航班跨平台价格对比:                                       │\n`;
 
-  if (prices.length > 0) {
-    prices.forEach((item, index) => {
-      const platformName = platformNames[item.platform] || item.platform;
-      const rank = index === 0 ? '⭐ 最低价' : `   ${index + 1}.`;
-      report += `│    ${rank} ${platformName.padEnd(8)} ¥${item.price.toString().padStart(4)}  ${item.url ? '🔗' : '   '}  │\n`;
+    // 按起飞时间分组航班
+    const flightGroups = {};
+    prices.forEach(item => {
+      const key = item.departureTime || 'unknown';
+      if (!flightGroups[key]) {
+        flightGroups[key] = [];
+      }
+      flightGroups[key].push(item);
     });
+
+    // 按时间排序
+    const sortedTimes = Object.keys(flightGroups).sort();
+
+    // 显示每个时间段的跨平台对比
+    sortedTimes.forEach((time) => {
+      const flights = flightGroups[time];
+      report += `│                                                                 │\n`;
+      report += `│  ⏰ ${time} 起飞:                                                   │\n`;
+
+      // 找出最低价
+      const lowestPrice = Math.min(...flights.map(f => f.price));
+
+      flights.forEach(flight => {
+        const platformName = platformNames[flight.platform] || flight.platform;
+        const isLowest = flight.price === lowestPrice;
+        const mark = isLowest ? '💚' : '  ';
+        const flightInfo = flight.flightNumber ? `${flight.flightNumber} ` : '';
+        const airlineInfo = flight.airline ? `(${flight.airline})` : '';
+
+        report += `│    ${mark} ${platformName} - ${flightInfo}¥${flight.price.toString().padStart(4)} ${airlineInfo}        │\n`;
+      });
+    });
+
+    // 显示总体最低价
+    const allPrices = prices.map(p => p.price);
+    const globalLowest = Math.min(...allPrices);
+    const lowestFlight = prices.find(p => p.price === globalLowest);
+
+    report += `│                                                                 │\n`;
+    report += `│  💰 全天最低价: ¥${globalLowest}                                       │\n`;
+    if (lowestFlight) {
+      const platformName = platformNames[lowestFlight.platform] || lowestFlight.platform;
+      report += `│     来自: ${platformName} (${lowestFlight.departureTime})                          │\n`;
+    }
   } else {
-    report += `│    暂无实时价格数据 - 请尝试手动访问以下平台:       │\n`;
+    // 旧版模式：仅显示各平台最低价
+    report += `│  📊 全网价格对比:                                               │`;
+
+    if (prices.length > 0) {
+      prices.forEach((item, index) => {
+        const platformName = platformNames[item.platform] || item.platform;
+        const rank = index === 0 ? '⭐ 最低价' : `   ${index + 1}.`;
+        report += `│    ${rank} ${platformName.padEnd(8)} ¥${item.price.toString().padStart(4)}  ${item.url ? '🔗' : '   '}           │\n`;
+      });
+    } else {
+      report += `│    暂无实时价格数据 - 请尝试手动访问以下平台:                   │\n`;
+    }
   }
 
-  report += '│                                                 │\n';
-  report += '│  🔗 快速访问链接:                                │\n';
+  report += `│                                                                 │\n`;
+  report += `│  🔗 快速访问链接:                                              │\n`;
 
   platforms.forEach(p => {
     const url = generateSearchURL(p, from, to, date);
     const platformName = platformNames[p] || p;
-    report += `│    • ${platformName.padEnd(8)} ${url.substring(0, 40)}...  │\n`;
+    report += `│    • ${platformName.padEnd(8)} ${url.substring(0, 45)}...        │\n`;
   });
 
-  report += '│                                                 │\n';
-  report += '│  💡 建议:                                       │\n';
+  report += `│                                                                 │\n`;
+  report += `│  💡 建议:                                                      │\n`;
 
   if (prices.length > 0) {
     const lowest = prices[0];
     const priceDiff = prices[prices.length - 1].price - lowest.price;
-    report += `│    当前${platformNames[lowest.platform] || lowest.platform}价格最低，比最高价省 ¥${priceDiff}       │\n`;
+    report += `│    当前${platformNames[lowest.platform] || lowest.platform}价格最低，比最高价省 ¥${priceDiff}              │\n`;
 
     // 基于节假日和天数的建议
     if (holidayInfo.isHoliday && holidayInfo.factor >= 1.5) {
-      report += `│    ⚠️  正值${holidayInfo.name}期间，建议尽快预订               │\n`;
+      report += `│    ⚠️  正值${holidayInfo.name}期间，建议尽快预订                             │\n`;
     } else if (daysUntil > 30) {
-      report += `│    距离出发还有${daysUntil}天，建议继续关注价格变化            │\n`;
+      report += `│    距离出发还有${daysUntil}天，建议继续关注价格变化                          │\n`;
     } else if (daysUntil > 14) {
-      report += `│    距离出发${daysUntil}天，进入最佳预订窗口期               │\n`;
+      report += `│    距离出发${daysUntil}天，进入最佳预订窗口期                             │\n`;
     } else if (daysUntil > 7) {
-      report += `│    距离出发${daysUntil}天，价格可能开始上涨，建议近期预订        │\n`;
+      report += `│    距离出发${daysUntil}天，价格可能开始上涨，建议近期预订                      │\n`;
     } else {
-      report += `│    距离出发仅${daysUntil}天，建议尽快购买                      │\n`;
+      report += `│    距离出发仅${daysUntil}天，建议尽快购买                                 │\n`;
     }
   } else {
-    report += `│    由于反爬虫限制，建议直接点击上方链接查看           │\n`;
-    report += `│    移动端页面通常有更好的价格和优惠                   │\n`;
+    report += `│    由于反爬虫限制，建议直接点击上方链接查看                       │\n`;
+    report += `│    移动端页面通常有更好的价格和优惠                               │\n`;
   }
 
-  report += '└─────────────────────────────────────────────────┘\n';
+  report += `└─────────────────────────────────────────────────────────────┘\n`;
 
   return report;
 }
@@ -1237,8 +1309,8 @@ export async function handleFlightQuery(query, mcpTools = null) {
     console.log(`🕐 时间偏好: ${timeMap[parsed.options.preferredTime]}`);
   }
 
-  // 平台列表和 URL 映射
-  const platforms = ['qunar', 'ctrip', 'fliggy', 'zhixing'];
+  // 平台列表和 URL 映射（扩展：包含OTA平台和主要航空公司官网）
+  const platforms = ['qunar', 'ctrip', 'fliggy', 'csair', 'ceair', 'hnair', 'xiamenair', 'shandong', 'shenzhen', 'zhixing'];
 
   // 如果有 Playwright MCP 工具，尝试抓取价格
   let prices = [];
@@ -1271,24 +1343,50 @@ export async function handleFlightQuery(query, mcpTools = null) {
       if (Object.keys(platformURLs).length === 0) {
         console.log('\n⚠️  所有平台都处于频率限制中，请稍后再试\n');
       } else {
-        // 使用包装器抓取所有平台（快速失败策略）
-        const results = await scrapeMultiplePlatforms(mcpTools, platformURLs);
+        // 使用增强的包装器抓取所有平台（支持标签页复用和登录检测）
+        const scrapeResult = await scrapeMultiplePlatforms(mcpTools, platformURLs, {
+          priority: shuffledPlatforms,  // 使用打乱后的顺序
+          reuseTabs: true
+        });
 
-        // 处理结果
-        for (const result of results) {
-          if (result.success && result.prices && result.prices.length > 0) {
-            const lowestPrice = Math.min(...result.prices);
-            prices.push({
-              platform: result.platform,
-              price: lowestPrice,
-              url: result.url,
-              allPrices: result.prices
-            });
+        // 处理结果 - 提取航班详情
+        for (const result of scrapeResult.results) {
+          if (result.success) {
+            // 优先使用航班详情数据
+            if (result.flights && result.flights.length > 0) {
+              // 将每个航班添加到列表中，包含平台信息
+              result.flights.forEach(flight => {
+                prices.push({
+                  platform: result.platform,
+                  url: result.url,
+                  departureTime: flight.departureTime,
+                  flightNumber: flight.flightNumber,
+                  airline: flight.airline,
+                  price: flight.price
+                });
+              });
+            } else if (result.prices && result.prices.length > 0) {
+              // 兼容旧逻辑：如果没有航班详情，使用最低价
+              const lowestPrice = Math.min(...result.prices);
+              prices.push({
+                platform: result.platform,
+                price: lowestPrice,
+                url: result.url,
+                allPrices: result.prices
+              });
+            }
           }
         }
 
-        // 按价格排序
-        prices.sort((a, b) => a.price - b.price);
+        // 按起飞时间排序，然后按价格排序
+        prices.sort((a, b) => {
+          if (a.departureTime && b.departureTime) {
+            return a.departureTime.localeCompare(b.departureTime);
+          }
+          return a.price - b.price;
+        });
+
+        // 登录提示已在 scrapeMultiplePlatforms 内部处理
       }
 
     } catch (error) {
